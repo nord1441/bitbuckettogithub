@@ -4,6 +4,8 @@ Bitbucket Cloud のワークスペースに含まれる全リポジトリを Git
 一括移行する Python 製 CLI です。標準ライブラリのみで動作します
 (外部 HTTP ライブラリ等は不要)。
 
+> 詳細な使い方は [docs/USAGE.md](docs/USAGE.md) を参照してください。
+
 ## 特徴
 
 - ワークスペース配下のリポジトリを Bitbucket REST API で列挙 (ページング対応)
