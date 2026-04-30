@@ -6,7 +6,7 @@ import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
 
 from . import log
 from .config import Config
@@ -65,17 +65,72 @@ def _parse_repo(obj: dict) -> BBRepo | None:
     )
 
 
-def _open(url: str, headers: dict[str, str]) -> dict:
+def _open(
+    url: str, headers: dict[str, str], *, raise_on_error: bool = True
+) -> tuple[int, dict | None, str]:
+    """Returns (status, json_body_or_None, raw_body)."""
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req) as resp:
             payload = resp.read().decode("utf-8")
+            return resp.status, (json.loads(payload) if payload else None), payload
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
+        text = e.read().decode("utf-8", errors="replace")
+        if raise_on_error:
+            _raise_api_error(e.code, url, text, e.headers)
+        try:
+            return e.code, json.loads(text) if text else None, text
+        except json.JSONDecodeError:
+            return e.code, None, text
+
+
+def _raise_api_error(
+    code: int, url: str, body: str, headers: Any | None = None
+) -> None:
+    snippet = body[:500] or "(empty body)"
+    extra = ""
+    if headers is not None:
+        wa = headers.get("WWW-Authenticate")
+        if wa:
+            extra = f"\n  WWW-Authenticate: {wa}"
+    raise SystemExit(
+        f"Bitbucket API error {code} for {url}:\n  {snippet}{extra}"
+    )
+
+
+def _check_credentials(headers: dict[str, str]) -> dict | None:
+    """Hit /user. Returns the parsed user object on success, raises with a
+    clear message on auth failure."""
+    code, body, raw = _open(
+        f"{API_BASE}/user", headers, raise_on_error=False
+    )
+    if code == 200 and body is not None:
+        return body
+    if code in (401, 403):
         raise SystemExit(
-            f"Bitbucket API error {e.code} for {url}: {body}"
-        ) from None
-    return json.loads(payload)
+            "Bitbucket authentication failed (HTTP "
+            f"{code} on /2.0/user).\n"
+            "  Check that BITBUCKET_USERNAME is your Bitbucket *username*\n"
+            "  (not email), and that the App Password has scopes:\n"
+            "    - Account: Read\n"
+            "    - Repositories: Read\n"
+            "  Note: Atlassian is phasing out Bitbucket App Passwords. If\n"
+            "  yours has been revoked or you cannot create one, switch to an\n"
+            "  Atlassian API token and set BITBUCKET_USERNAME to your\n"
+            "  account email.\n"
+            f"  Response body: {raw[:400] or '(empty)'}"
+        )
+    _raise_api_error(code, f"{API_BASE}/user", raw)
+    return None  # unreachable
+
+
+def _list_workspace_slugs(headers: dict[str, str]) -> list[str]:
+    code, body, _raw = _open(
+        f"{API_BASE}/workspaces?pagelen=100", headers, raise_on_error=False
+    )
+    if code != 200 or not body:
+        return []
+    return [v.get("slug") for v in body.get("values", []) if v.get("slug")]
 
 
 def list_repositories(cfg: Config) -> list[BBRepo]:
@@ -86,15 +141,45 @@ def list_repositories(cfg: Config) -> list[BBRepo]:
         ),
         "User-Agent": "b2g-py/0.1",
     }
+
+    # Pre-flight 1: validate credentials. This turns the most common failure
+    # mode (bad PAT/app-password) into an actionable message before we touch
+    # any workspace-specific endpoint.
+    user = _check_credentials(headers)
+    if user is not None:
+        log.info(
+            f"bitbucket auth ok as "
+            f"{user.get('username') or user.get('display_name') or '?'}"
+        )
+
     url: str | None = (
         f"{API_BASE}/repositories/{cfg.bitbucket_workspace}"
         "?pagelen=100&role=member"
     )
     out: list[BBRepo] = []
+    first = True
     while url:
-        page = _open(url, headers)
-        for raw in page.get("values", []):
-            r = _parse_repo(raw)
+        if first:
+            first = False
+            code, page, raw = _open(url, headers, raise_on_error=False)
+            if code in (401, 403, 404):
+                slugs = _list_workspace_slugs(headers)
+                hint = (
+                    "\n  Available workspaces for this credential: "
+                    + (", ".join(slugs) if slugs else "(none found)")
+                )
+                raise SystemExit(
+                    f"Bitbucket workspace '{cfg.bitbucket_workspace}' is not "
+                    f"accessible (HTTP {code}).{hint}\n"
+                    "  Pass one of the slugs above with --workspace."
+                )
+            if code >= 400 or page is None:
+                _raise_api_error(code, url, raw)
+        else:
+            _code, page, _raw = _open(url, headers)
+        assert page is not None
+        for repo_obj in page.get("values", []):
+            r = _parse_repo(repo_obj)
             if r is not None:
                 out.append(r)
         url = page.get("next")

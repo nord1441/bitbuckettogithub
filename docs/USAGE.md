@@ -299,6 +299,28 @@ python -m b2g --workspace my-bb-team
 
 - App Password の権限不足 (Repositories: Read 必須)
 - ユーザー名がメールアドレスになっている (App Password はユーザー名で認証)
+- **Atlassian は Bitbucket Cloud の App Password を段階的廃止しています。**
+  既存のものが失効している / 新規作成できない場合は **Atlassian API token**
+  に切り替え、`BITBUCKET_USERNAME` には Atlassian アカウントのメールを設定
+  してください (Basic 認証は `<email>:<api-token>` になります)。
+
+切り分けに便利な curl:
+
+```bash
+# (a) 認証情報そのものの検証
+curl -s -o /dev/null -w "/user => %{http_code}\n" \
+  -u "$BITBUCKET_USERNAME:$BITBUCKET_APP_PASSWORD" \
+  https://api.bitbucket.org/2.0/user
+
+# (b) 自分がアクセスできるワークスペース一覧
+curl -s -u "$BITBUCKET_USERNAME:$BITBUCKET_APP_PASSWORD" \
+  https://api.bitbucket.org/2.0/workspaces \
+  | python -m json.tool | grep '"slug"'
+```
+
+(a) が 200 なら認証 OK。(b) で出てきた `slug` を `--workspace` に渡してください。
+`b2g` 側でも v0.1.1 以降は同等のプリフライト確認を行い、ワークスペース 401 時には
+利用可能なスラッグ候補を表示します。
 
 ### `GitHub repo creation failed: HTTP 422 ... name already exists`
 
