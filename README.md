@@ -1,111 +1,118 @@
 # bitbuckettogithub
 
-Bitbucket Cloud のワークスペースに含まれる全リポジトリを GitHub に
-一括移行する Python 製 CLI です。標準ライブラリのみで動作します
-(外部 HTTP ライブラリ等は不要)。
+Bitbucket Cloud (Free) のワークスペースに含まれる全リポジトリを
+GitHub (Free) に一括移行する **shell スクリプト** です。
+**プライベートリポジトリはプライベートのまま**、Git LFS にも対応します。
 
-> 詳細な使い方は [docs/USAGE.md](docs/USAGE.md) を参照してください。
+## できること
 
-## 特徴
+- ワークスペース配下の全リポジトリの **Git 履歴 / 全ブランチ / 全タグ** を移送
+- リポジトリの **`is_private` (公開/非公開)** をそのまま引き継ぎ
+- Git **LFS オブジェクト** の同期 (`git-lfs` がインストール済みの場合)
+- 既に存在するリポジトリへの追加 push (デフォルト) または スキップ (`SKIP_EXISTING=1`)
+- 計画のみ表示 (`DRY_RUN=1`)
 
-- ワークスペース配下のリポジトリを Bitbucket REST API で列挙 (ページング対応)
-- GitHub 側に同名リポジトリを自動作成し、**`is_private` を引き継ぐ**
-  (プライベートリポジトリはプライベートのまま)
-- `git clone --mirror` + `git push --mirror` で全 ref / tag / branch を移送
-- **Git LFS** に対応 (`git lfs fetch --all` → `git lfs push --all`)
-- 既に存在する GitHub リポジトリの取扱いを `--skip-existing` で制御
-- `--dry-run` で実行計画のみ表示
-- `--rename SRC=DST` で個別にリポジトリ名を変更可能
+移行対象外: Pull Request / Issue / Pipelines / Wiki / Webhook など。
 
-## 必要環境
+## 必要なもの
 
-- Python 3.10 以上 (標準ライブラリのみ)
-- `git` 本体 (1.8 以降)
-- `git-lfs` (LFS リポジトリを扱う場合)
-- 環境変数 (推奨: Atlassian API token):
-  - `BITBUCKET_EMAIL` — Atlassian アカウントのメールアドレス
-  - `BITBUCKET_API_TOKEN` — Bitbucket スコープ付き API token
-    (`read:account`, `read:repository:bitbucket` が必須)
-  - `GITHUB_TOKEN` — GitHub Personal Access Token
-    (`repo` スコープ。Org に作成する場合はさらに `admin:org` も推奨)
-- 旧式の App Password を使う場合は代わりに
-  `BITBUCKET_USERNAME` / `BITBUCKET_APP_PASSWORD` を設定してください
-  (Atlassian は App Password を段階廃止中)。
-
-## インストール
-
-```
-pip install .
-```
-
-または直接モジュール実行:
-
-```
-python -m b2g --help
-```
+- **bash** (4 以上)、**curl**、**jq**、**git**
+- **git-lfs** (LFS リポジトリを扱う場合のみ)
+- **Bitbucket の API token** (Atlassian アカウントの API token、もしくは
+  Bitbucket UI で発行する Workspace/Project/Repository Access Token のいずれか)
+  - スコープ:
+    - Atlassian API token: `read:account`, `read:repository:bitbucket`
+    - Bitbucket Access Token: `Account: Read`, `Repositories: Read`
+- **GitHub Personal Access Token (Classic 推奨)**
+  - スコープ: `repo` (フル)。Org に作成する場合は `admin:org` も推奨
 
 ## 使い方
 
-ユーザーアカウント直下に作成する例:
+```bash
+# 必須
+export BB_WORKSPACE="my-bb-team"            # Bitbucket workspace slug
+export BITBUCKET_API_TOKEN="ATATT3xFf..."   # Bitbucket / Atlassian token
+export GITHUB_TOKEN="ghp_xxxxxxxx"          # GitHub PAT
 
-```
-export BITBUCKET_EMAIL=alice@example.com
-export BITBUCKET_API_TOKEN=ATATT3xFfGF0...
-export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+# オプション
+# export BITBUCKET_EMAIL="alice@example.com"  # Atlassian token を Basic 認証で
+                                              # 使いたいときだけ設定
+# export GH_ORG="my-gh-org"                   # 指定すると Org 直下に作成
+# export WORK_DIR="/var/tmp/bb2gh"            # 一時 mirror clone の置き場
+# export DRY_RUN=1                            # 実行せず計画のみ
+# export SKIP_EXISTING=1                      # 既存 GitHub repo はスキップ
 
-python -m b2g \
-  --workspace my-bb-team \
-  --work-dir /var/tmp/b2g
-```
-
-GitHub Organization に作成する場合:
-
-```
-python -m b2g \
-  --workspace my-bb-team \
-  --github-org my-gh-org
+./migrate.sh
 ```
 
-事前確認だけしたいとき:
-
-```
-python -m b2g --workspace my-bb-team --dry-run
-```
-
-リポジトリ名を変更しつつ移行:
-
-```
-python -m b2g \
-  --workspace my-bb-team \
-  --rename old-name=new-name \
-  --rename legacy_repo=legacy-repo
-```
+スクリプトは起動時に Bitbucket の認証方式 (Bearer / Basic / x-token-auth) を
+自動判別します。`BITBUCKET_API_TOKEN` だけ渡せば最初は Bearer で叩き、
+401 が返れば順に Basic, x-token-auth と試行します。
 
 ## 動作の流れ (リポジトリ毎)
 
-1. Bitbucket API でリポジトリを列挙 (ページング対応)
-2. GitHub に同名リポジトリが存在するか `GET /repos/:owner/:repo` で確認
-3. 無ければ `POST /user/repos` または `POST /orgs/:org/repos` で作成
-   (`private` は Bitbucket 側の値をそのまま設定)
-4. `git clone --mirror` で Bitbucket からベアミラーを取得
-5. `git lfs fetch --all` で LFS オブジェクトを取得 (LFS 不使用なら no-op)
-6. `git push --mirror` で GitHub へ全 ref / tag を送出
-7. `git lfs push --all` で LFS オブジェクトを送出
+1. `GET /repos/<owner>/<slug>` で GitHub 側の存在確認
+2. 無ければ `POST /user/repos` または `POST /orgs/<org>/repos` で作成
+   (`private` は Bitbucket 側の `is_private` をそのまま設定)
+3. `git clone --mirror` で Bitbucket からベアミラーを取得
+4. `git lfs fetch --all` で LFS オブジェクトを取得 (LFS 不使用なら no-op)
+5. `git push --mirror` で GitHub へ全 ref / branch / tag を送出
+6. `git lfs push --all` で LFS オブジェクトを送出
 
-clone / push 用 URL には `https://USER:TOKEN@host/...` 形式で
-資格情報を埋め込み、ディスクに資格情報を保存しません。
-ログには `***` でマスクして出力します。
+URL には `https://USER:TOKEN@host/...` 形式で資格情報を埋め込みます。
+ディスク上には資格情報を保存しません (`WORK_DIR` 内のミラーは bare repo のみ)。
 
-## 終了コード
+## ログの読み方
 
-- `0` — 全リポジトリの移行に成功
-- `1` — 1件以上の失敗あり (それぞれの詳細は `[error]` ログを参照)
+```
+[info]  通常の進捗・状態
+[step]  実際に実行する HTTP / git コマンド
+[warn]  続行はするが注意が必要な事象
+[error] リポジトリ単位の失敗 (他リポジトリは続行)
+```
+
+終了コード 0 = 全成功 / 1 = 1件以上失敗。
+
+## トラブルシューティング
+
+### `could not authenticate to Bitbucket`
+
+- Atlassian API token を使っているなら、**スコープ付き API token** が必要
+  - <https://id.atlassian.com/manage-profile/security/api-tokens>
+  - **"Create API token with scopes"** を選び、`read:account` と
+    `read:repository:bitbucket` を含める
+- Bitbucket 側で Workspace Access Token を発行する場合は
+  `Account: Read` + `Repositories: Read` を付与
+- `BITBUCKET_EMAIL` を設定しても効果が無いときは、Bearer 認証のみで通る token です
+  (スクリプトは自動的に切替えます)
+
+### `Bitbucket workspace 'xxx' is not accessible (HTTP 404)`
+
+`BB_WORKSPACE` の slug が間違っている可能性が高いです:
+
+```bash
+# 自分がアクセスできる workspace 一覧を確認
+curl -s -H "Authorization: Bearer $BITBUCKET_API_TOKEN" \
+  https://api.bitbucket.org/2.0/workspaces \
+  | jq -r '.values[].slug'
+```
+
+### `git: 'lfs' is not a git command`
+
+`git-lfs` をインストールしてください:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install git-lfs && git lfs install
+# macOS
+brew install git-lfs && git lfs install
+```
+
+未インストールでも LFS 以外の移行は通常通り完走します (LFS は警告のみ)。
 
 ## 注意
 
-- App Password と PAT は秘密情報です。シェル履歴に残さないでください
-  (`direnv` などの利用を推奨)。
-- LFS オブジェクトの容量によっては GitHub の LFS 転送上限に達する可能性が
-  あります。事前に容量を見積もってください。
-- Bitbucket 側の Issue / Pull Request / Pipelines は移行対象外です
-  (Git の履歴とタグ・ブランチのみ)。
+- `BITBUCKET_API_TOKEN` / `GITHUB_TOKEN` はシェル履歴に直接書かないでください
+  (`direnv` などの利用を推奨)
+- GitHub Free の **LFS 帯域 / 容量上限** に注意 (1 GB / 1 GB 帯域・月)
+- `WORK_DIR` には全リポジトリ容量分の空きを確保
