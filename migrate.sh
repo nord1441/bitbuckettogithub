@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+# Never let git block on a credential prompt — fail fast instead.
+export GIT_TERMINAL_PROMPT=0
+export GIT_ASKPASS=/bin/echo
+
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
@@ -26,9 +30,8 @@ GH_API="https://api.github.com"
 UA="bb2gh-shell/0.1"
 
 # These are filled in by detect_bb_auth(); used by every later HTTP/git call.
-BB_AUTH_HEADER=""   # e.g.  "Authorization: Bearer xxx"
-BB_GIT_USER=""      # username portion of https://USER:TOKEN@bitbucket.org/...
-BB_GIT_SECRET=""    # password portion (always == BITBUCKET_API_TOKEN)
+BB_AUTH_HEADER=""   # e.g.  "Authorization: Bearer xxx" — used both for the
+                    # REST API and (via http.extraHeader) for git transport.
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -79,12 +82,6 @@ detect_bb_auth() {
     if [ "$status" = "200" ]; then
       log "bitbucket auth ok via $mode"
       BB_AUTH_HEADER="$header"
-      case "$mode" in
-        bearer)     BB_GIT_USER="x-token-auth" ;;
-        basic)      BB_GIT_USER="$BITBUCKET_EMAIL" ;;
-        token-auth) BB_GIT_USER="x-token-auth" ;;
-      esac
-      BB_GIT_SECRET="$BITBUCKET_API_TOKEN"
       return 0
     fi
     warn "bitbucket auth via $mode returned HTTP $status"
@@ -178,7 +175,8 @@ gh_create_repo() {
   out="$(gh_curl POST "$path" "$body")"
   http="${out##*$'\n'}"
   if [ "$http" != "201" ] && [ "$http" != "202" ]; then
-    die "GitHub create-repo $name failed (HTTP $http): ${out%$'\n'*}"
+    err "GitHub create-repo $name failed (HTTP $http): ${out%$'\n'*}"
+    return 1
   fi
 }
 
@@ -227,16 +225,20 @@ migrate_one() {
   else
     step "    creating github repo ${gh_owner}/${slug} (${privacy_label})"
     if [ "$DRY_RUN" != "1" ]; then
-      gh_create_repo "$slug" "$desc" "$private"
+      gh_create_repo "$slug" "$desc" "$private" || return 1
     fi
   fi
 
-  # 2. Build authed URLs (credentials embedded for git transport).
-  local bb_path bb_authed gh_authed local_dir
-  bb_path="${bb_https#https://}"           # e.g. bitbucket.org/ws/slug.git
-  bb_authed="https://$(urlenc "$BB_GIT_USER"):$(urlenc "$BB_GIT_SECRET")@${bb_path}"
+  # 2. Build URLs.
+  #    - For Bitbucket we authenticate via http.extraHeader, which works
+  #      regardless of the underlying token type (Atlassian API token vs
+  #      Bitbucket access token vs Bearer-only tokens).
+  #    - For GitHub, embedding the PAT in the URL is fine.
+  local gh_authed local_dir
   gh_authed="https://x-access-token:$(urlenc "$GITHUB_TOKEN")@github.com/${gh_owner}/${slug}.git"
   local_dir="${WORK_DIR}/${slug}.git"
+
+  local bb_git_cfg=( -c "http.https://bitbucket.org/.extraHeader=${BB_AUTH_HEADER}" )
 
   if [ "$DRY_RUN" = "1" ]; then
     log "    [dry-run] would clone --mirror ${bb_https}"
@@ -247,12 +249,13 @@ migrate_one() {
   # 3. mirror clone (bare) — idempotent: nuke any leftover.
   rm -rf -- "$local_dir"
   step "    clone --mirror ${bb_https}"
-  git clone --mirror "$bb_authed" "$local_dir"
+  git "${bb_git_cfg[@]}" clone --mirror "$bb_https" "$local_dir" \
+    || { err "    clone failed for ${slug}"; return 1; }
 
   # 4. LFS fetch (no-op when not used; warn-only if git-lfs missing)
   if command -v git-lfs >/dev/null 2>&1; then
     step "    git lfs fetch --all"
-    (cd "$local_dir" && git lfs fetch --all) \
+    ( cd "$local_dir" && git "${bb_git_cfg[@]}" lfs fetch --all ) \
       || warn "    git lfs fetch failed (likely no LFS data); continuing"
   else
     warn "    git-lfs not installed; skipping LFS fetch/push"
@@ -260,12 +263,13 @@ migrate_one() {
 
   # 5. mirror push to GitHub
   step "    push --mirror -> https://github.com/${gh_owner}/${slug}.git"
-  (cd "$local_dir" && git push --mirror "$gh_authed")
+  ( cd "$local_dir" && git push --mirror "$gh_authed" ) \
+    || { err "    push failed for ${slug}"; return 1; }
 
   # 6. LFS push
   if command -v git-lfs >/dev/null 2>&1; then
     step "    git lfs push --all"
-    (cd "$local_dir" && git lfs push --all "$gh_authed") \
+    ( cd "$local_dir" && git lfs push --all "$gh_authed" ) \
       || warn "    git lfs push failed (likely no LFS data); continuing"
   fi
 }
