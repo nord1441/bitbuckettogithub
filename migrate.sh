@@ -29,9 +29,15 @@ BB_API="https://api.bitbucket.org/2.0"
 GH_API="https://api.github.com"
 UA="bb2gh-shell/0.1"
 
-# These are filled in by detect_bb_auth(); used by every later HTTP/git call.
-BB_AUTH_HEADER=""   # e.g.  "Authorization: Bearer xxx" — used both for the
-                    # REST API and (via http.extraHeader) for git transport.
+# Filled in by detect_bb_auth(): the Authorization header that succeeded
+# against the REST API.
+BB_AUTH_HEADER=""
+
+# Filled in by detect_git_transport(): how to authenticate `git` against
+# bitbucket.org for clone/push.
+#   "header"     → use http.extraHeader with $BB_AUTH_HEADER
+#   "url-token"  → embed https://x-token-auth:TOKEN@... in the clone URL
+BB_GIT_MODE=""
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -116,6 +122,78 @@ bb_curl() {
 # URL-encode a single path segment. Handles `@`, `+`, etc.
 urlenc() {
   jq -rn --arg v "$1" '$v | @uri'
+}
+
+# -----------------------------------------------------------------------------
+# git transport detection (separate from REST auth)
+# -----------------------------------------------------------------------------
+# Atlassian API tokens authenticate fine against api.bitbucket.org but are
+# *rejected* by bitbucket.org for the git smart protocol. To handle that, we
+# probe the live git transport using a known repo URL before kicking off the
+# real migration. Two strategies are tried in turn:
+#
+#   1. http.extraHeader = $BB_AUTH_HEADER
+#        Works for Bearer-capable tokens (Workspace/Repo Access Tokens) and
+#        for legacy App Passwords used via the Basic header.
+#   2. URL-embedded https://x-token-auth:TOKEN@bitbucket.org/...
+#        Works for Workspace/Repo Access Tokens.
+#
+# If both fail, the user almost certainly has an Atlassian-only API token and
+# needs a Bitbucket-side Workspace Access Token instead.
+detect_git_transport() {
+  local probe_url="$1"
+  step "verifying git transport against ${probe_url}"
+
+  if git -c "http.https://bitbucket.org/.extraHeader=${BB_AUTH_HEADER}" \
+         ls-remote "$probe_url" >/dev/null 2>&1; then
+    log "git transport ok (extraHeader mode)"
+    BB_GIT_MODE="header"
+    return 0
+  fi
+  warn "git extraHeader auth rejected; trying x-token-auth URL"
+
+  local rest authed
+  rest="${probe_url#https://}"
+  authed="https://x-token-auth:$(urlenc "$BITBUCKET_API_TOKEN")@${rest}"
+  if git ls-remote "$authed" >/dev/null 2>&1; then
+    log "git transport ok (x-token-auth URL mode)"
+    BB_GIT_MODE="url-token"
+    return 0
+  fi
+
+  err "git transport authentication failed for both supported modes."
+  err "  Your token authenticates against the REST API but cannot push/clone"
+  err "  via git. This is the typical behavior of an Atlassian-account API"
+  err "  token (id.atlassian.com); those work for /2.0/* but not for"
+  err "  bitbucket.org git over HTTPS."
+  err ""
+  err "  Fix: create a *Bitbucket Workspace Access Token* (not an Atlassian"
+  err "  API token). In Bitbucket, open:"
+  err "    https://bitbucket.org/${BB_WORKSPACE}/workspace/settings/access-tokens"
+  err "  → Create access token → grant 'Repositories: Read' (and"
+  err "  'Account: Read' if you want /2.0/user to work). Use that token as"
+  err "  BITBUCKET_API_TOKEN, and unset BITBUCKET_EMAIL."
+  return 1
+}
+
+# Build a clone URL appropriate for the active git transport mode.
+bb_clone_url() {
+  local raw="$1"
+  if [ "$BB_GIT_MODE" = "url-token" ]; then
+    local rest="${raw#https://}"
+    printf 'https://x-token-auth:%s@%s' \
+      "$(urlenc "$BITBUCKET_API_TOKEN")" "$rest"
+  else
+    printf '%s' "$raw"
+  fi
+}
+
+# Extra `git -c` flags appropriate for the active git transport mode.
+bb_git_cfg() {
+  if [ "$BB_GIT_MODE" = "header" ]; then
+    printf '%s\n' "-c" \
+      "http.https://bitbucket.org/.extraHeader=${BB_AUTH_HEADER}"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -229,16 +307,17 @@ migrate_one() {
     fi
   fi
 
-  # 2. Build URLs.
-  #    - For Bitbucket we authenticate via http.extraHeader, which works
-  #      regardless of the underlying token type (Atlassian API token vs
-  #      Bitbucket access token vs Bearer-only tokens).
-  #    - For GitHub, embedding the PAT in the URL is fine.
-  local gh_authed local_dir
+  # 2. Build URLs / git config.
+  local gh_authed local_dir bb_url
   gh_authed="https://x-access-token:$(urlenc "$GITHUB_TOKEN")@github.com/${gh_owner}/${slug}.git"
   local_dir="${WORK_DIR}/${slug}.git"
+  bb_url="$(bb_clone_url "$bb_https")"
 
-  local bb_git_cfg=( -c "http.https://bitbucket.org/.extraHeader=${BB_AUTH_HEADER}" )
+  # Read bb_git_cfg into an array (may be empty).
+  local -a bb_cfg=()
+  if [ "$BB_GIT_MODE" = "header" ]; then
+    bb_cfg=(-c "http.https://bitbucket.org/.extraHeader=${BB_AUTH_HEADER}")
+  fi
 
   if [ "$DRY_RUN" = "1" ]; then
     log "    [dry-run] would clone --mirror ${bb_https}"
@@ -249,13 +328,13 @@ migrate_one() {
   # 3. mirror clone (bare) — idempotent: nuke any leftover.
   rm -rf -- "$local_dir"
   step "    clone --mirror ${bb_https}"
-  git "${bb_git_cfg[@]}" clone --mirror "$bb_https" "$local_dir" \
+  git "${bb_cfg[@]}" clone --mirror "$bb_url" "$local_dir" \
     || { err "    clone failed for ${slug}"; return 1; }
 
   # 4. LFS fetch (no-op when not used; warn-only if git-lfs missing)
   if command -v git-lfs >/dev/null 2>&1; then
     step "    git lfs fetch --all"
-    ( cd "$local_dir" && git "${bb_git_cfg[@]}" lfs fetch --all ) \
+    ( cd "$local_dir" && git "${bb_cfg[@]}" lfs fetch --all ) \
       || warn "    git lfs fetch failed (likely no LFS data); continuing"
   else
     warn "    git-lfs not installed; skipping LFS fetch/push"
@@ -287,6 +366,18 @@ main() {
   local total
   total="$(printf '%s' "$repos_jsonl" | grep -c . || true)"
   log "found ${total} repository(ies)"
+  if [ "$total" -eq 0 ]; then
+    die "no repositories returned by Bitbucket; aborting"
+  fi
+
+  # Probe git transport with the first repo's clone URL before kicking off
+  # the (potentially long) migration loop. This converts a token type
+  # mismatch from "all 25 fail with the same message" into one clear error.
+  local probe_url
+  probe_url="$(printf '%s' "$repos_jsonl" | head -1 | jq -r .https)"
+  if [ "$DRY_RUN" != "1" ]; then
+    detect_git_transport "$probe_url" || exit 1
+  fi
 
   local gh_owner
   gh_owner="$(gh_owner_login)"

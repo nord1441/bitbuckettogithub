@@ -18,11 +18,14 @@ GitHub (Free) に一括移行する **shell スクリプト** です。
 
 - **bash** (4 以上)、**curl**、**jq**、**git**
 - **git-lfs** (LFS リポジトリを扱う場合のみ)
-- **Bitbucket の API token** (Atlassian アカウントの API token、もしくは
-  Bitbucket UI で発行する Workspace/Project/Repository Access Token のいずれか)
-  - スコープ:
-    - Atlassian API token: `read:account`, `read:repository:bitbucket`
-    - Bitbucket Access Token: `Account: Read`, `Repositories: Read`
+- **Bitbucket Workspace Access Token** (推奨)
+  - 発行先: `https://bitbucket.org/<workspace>/workspace/settings/access-tokens`
+  - 権限: **Repositories: Read** (必須) / **Account: Read** (推奨)
+  - **重要:** [Atlassian アカウントの API token (id.atlassian.com) は git
+    over HTTPS では受け付けてもらえません](#atlassian-api-token-では-clone-できない)。
+    REST API は通っても `git clone` が `Authentication failed` で弾かれます。
+    必ず Bitbucket 側で発行する **Workspace Access Token** か Repository
+    Access Token を使ってください。
 - **GitHub Personal Access Token (Classic 推奨)**
   - スコープ: `repo` (フル)。Org に作成する場合は `admin:org` も推奨
 
@@ -34,9 +37,9 @@ export BB_WORKSPACE="my-bb-team"            # Bitbucket workspace slug
 export BITBUCKET_API_TOKEN="ATATT3xFf..."   # Bitbucket / Atlassian token
 export GITHUB_TOKEN="ghp_xxxxxxxx"          # GitHub PAT
 
-# オプション
-# export BITBUCKET_EMAIL="alice@example.com"  # Atlassian token を Basic 認証で
-                                              # 使いたいときだけ設定
+# オプション (Workspace Access Token を使う場合は不要)
+# export BITBUCKET_EMAIL="alice@example.com"  # Atlassian API token を Basic 認証
+                                              # で REST API に通したいときのみ
 # export GH_ORG="my-gh-org"                   # 指定すると Org 直下に作成
 # export WORK_DIR="/var/tmp/bb2gh"            # 一時 mirror clone の置き場
 # export DRY_RUN=1                            # 実行せず計画のみ
@@ -74,6 +77,31 @@ URL には `https://USER:TOKEN@host/...` 形式で資格情報を埋め込みま
 終了コード 0 = 全成功 / 1 = 1件以上失敗。
 
 ## トラブルシューティング
+
+### Atlassian API token では clone できない
+
+REST API には通るのに、各リポジトリの clone で
+`fatal: Authentication failed for 'https://bitbucket.org/.../...git/'`
+が出るパターンです。
+
+**原因:** Atlassian アカウント側の API token (id.atlassian.com で作るもの) は
+`api.bitbucket.org` の REST API には使えますが、`bitbucket.org` の
+**git smart protocol では認証情報として受け付けてもらえません**。
+
+**対処:** Bitbucket UI で **Workspace Access Token** を発行して使ってください。
+
+```
+https://bitbucket.org/<workspace>/workspace/settings/access-tokens
+  → Create access token
+  → Repositories: Read (必須) / Account: Read (推奨)
+```
+
+このトークンを `BITBUCKET_API_TOKEN` に設定し、`BITBUCKET_EMAIL` は
+**unset / 空** にして再実行すれば通ります。
+
+スクリプトは起動時に git 転送のプリフライト
+(`git ls-remote` を最初の1リポジトリに対して実行) を行い、ここで失敗した
+場合は同じ案内を出して全体を中断します。
 
 ### `could not authenticate to Bitbucket`
 
