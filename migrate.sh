@@ -27,6 +27,8 @@ DRY_RUN="${DRY_RUN:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 OVERWRITE_EXISTING="${OVERWRITE_EXISTING:-0}"  # 1 = DELETE+recreate existing GitHub repo
 BB_GIT_SSH="${BB_GIT_SSH:-0}"            # 1 = use ssh for clone/push from Bitbucket
+AUTO_LFS_MIGRATE="${AUTO_LFS_MIGRATE:-0}"           # 1 = on push reject, migrate large files to LFS and retry
+LFS_MIGRATE_THRESHOLD="${LFS_MIGRATE_THRESHOLD:-100MB}"  # threshold for that migration
 
 if [ "$SKIP_EXISTING" = "1" ] && [ "$OVERWRITE_EXISTING" = "1" ]; then
   printf '[error] SKIP_EXISTING and OVERWRITE_EXISTING are mutually exclusive\n' >&2
@@ -285,6 +287,61 @@ gh_repo_exists() {
   [ "$http" = "200" ]
 }
 
+# Push the bare mirror to GitHub. On failure due to GitHub's per-file size
+# cap, optionally rewrite history with `git lfs migrate import` to move
+# large files into LFS, then retry. Only runs the migrate step when
+# AUTO_LFS_MIGRATE=1 (rewriting history is destructive).
+gh_push_mirror() {
+  local local_dir="$1" gh_authed="$2"
+  local log_file rc
+  log_file="$(mktemp)"
+
+  ( cd "$local_dir" && git push --mirror "$gh_authed" ) 2>&1 | tee "$log_file"
+  rc="${PIPESTATUS[0]}"
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$log_file"
+    return 0
+  fi
+
+  # Did GitHub reject because of the 100MB-per-file cap?
+  if grep -qE "exceeds GitHub's file size limit|GH001: Large files detected" \
+       "$log_file"; then
+    if [ "$AUTO_LFS_MIGRATE" != "1" ]; then
+      err "    push rejected: a file exceeds GitHub's per-file size limit (100MB)."
+      err "    Re-run with AUTO_LFS_MIGRATE=1 to convert files larger than"
+      err "    \${LFS_MIGRATE_THRESHOLD} (currently ${LFS_MIGRATE_THRESHOLD}) to Git LFS"
+      err "    before pushing. Note: this REWRITES history (commit SHAs change)."
+      rm -f "$log_file"
+      return 1
+    fi
+    if ! command -v git-lfs >/dev/null 2>&1; then
+      err "    git-lfs not installed; cannot auto-migrate large files"
+      rm -f "$log_file"
+      return 1
+    fi
+    rm -f "$log_file"
+
+    warn "    AUTO_LFS_MIGRATE=1: moving files >${LFS_MIGRATE_THRESHOLD} to Git LFS and retrying push"
+    if ! ( cd "$local_dir" && \
+           git lfs migrate import --everything \
+             --above="$LFS_MIGRATE_THRESHOLD" ); then
+      err "    git lfs migrate import failed"
+      return 1
+    fi
+
+    # Second push attempt — the rewrite changed every commit that touched
+    # a large file, so it MUST be a force update on the destination.
+    log_file="$(mktemp)"
+    ( cd "$local_dir" && git push --mirror "$gh_authed" ) 2>&1 | tee "$log_file"
+    rc="${PIPESTATUS[0]}"
+    rm -f "$log_file"
+    return "$rc"
+  fi
+
+  rm -f "$log_file"
+  return 1
+}
+
 gh_delete_repo() {
   # DELETE /repos/{owner}/{repo}. Requires the PAT to carry the delete_repo
   # scope (not included in plain `repo`). 204 = deleted, 404 = already gone.
@@ -421,9 +478,9 @@ migrate_one() {
     warn "    git-lfs not installed; skipping LFS fetch/push"
   fi
 
-  # 5. mirror push to GitHub
+  # 5. mirror push to GitHub (with optional auto-LFS-migrate fallback)
   step "    push --mirror -> https://github.com/${gh_owner}/${slug}.git"
-  ( cd "$local_dir" && git push --mirror "$gh_authed" ) \
+  gh_push_mirror "$local_dir" "$gh_authed" \
     || { err "    push failed for ${slug}"; return 1; }
 
   # 6. LFS push

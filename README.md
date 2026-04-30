@@ -66,9 +66,43 @@ export GITHUB_TOKEN="ghp_xxxxxxxx"
 # export DRY_RUN=1                   # 実行せず計画のみ
 # export SKIP_EXISTING=1             # 既存 GitHub repo はスキップ
 # export OVERWRITE_EXISTING=1        # 既存 GitHub repo を削除→再作成→push
+# export AUTO_LFS_MIGRATE=1          # 100MB 超のファイルが原因で push が
+                                     # 拒否されたら自動で LFS 化して再 push
+# export LFS_MIGRATE_THRESHOLD=100MB # AUTO_LFS_MIGRATE 時の閾値 (既定: 100MB)
 ```
 
 `SKIP_EXISTING` と `OVERWRITE_EXISTING` は排他です(両方 1 にすると起動時に拒否)。
+
+### `AUTO_LFS_MIGRATE=1` を使う場合の注意
+
+GitHub には **単一ファイル 100MB の上限** があります。Bitbucket では普通の
+git オブジェクトとして入っていた巨大ファイルを GitHub に push すると、
+
+```
+remote: error: File path/to/big.zip is 198.78 MB; this exceeds GitHub's file size limit of 100.00 MB
+remote: error: GH001: Large files detected.
+! [remote rejected] master -> master (pre-receive hook declined)
+```
+
+のように pre-receive で蹴られます。`AUTO_LFS_MIGRATE=1` を設定すると、
+push が上記エラーで失敗した場合に限り
+
+```
+git lfs migrate import --everything --above=$LFS_MIGRATE_THRESHOLD
+```
+
+を mirror clone 上で実行し、対象ファイルを LFS pointer に置き換えてから
+再 push します。閾値は `LFS_MIGRATE_THRESHOLD` (既定 `100MB`) で調整可能。
+
+注意点:
+
+- **git の履歴が書き換わります** (該当ファイルに触れた全コミットの SHA が変わる)。
+  これに伴い `mirror push` は強制更新となるため、GitHub 側に手動で書き換えた
+  ものが残っていても上書きされます。
+- `git-lfs` がインストールされている必要があります (未導入なら警告して中止)。
+- LFS にしたぶんは GitHub の **LFS 帯域 / 容量上限** を消費します
+  (Free プランは合計 1 GB)。事前にファイルサイズを把握してください。
+- 一度 LFS 化したファイルを取り戻すには `git lfs migrate export` などが必要です。
 
 ### `OVERWRITE_EXISTING=1` を使う場合の注意
 
