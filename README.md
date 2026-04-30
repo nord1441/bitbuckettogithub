@@ -18,35 +18,69 @@ GitHub (Free) に一括移行する **shell スクリプト** です。
 
 - **bash** (4 以上)、**curl**、**jq**、**git**
 - **git-lfs** (LFS リポジトリを扱う場合のみ)
-- **Bitbucket Workspace Access Token** (推奨)
-  - 発行先: `https://bitbucket.org/<workspace>/workspace/settings/access-tokens`
-  - 権限: **Repositories: Read** (必須) / **Account: Read** (推奨)
-  - **重要:** [Atlassian アカウントの API token (id.atlassian.com) は git
-    over HTTPS では受け付けてもらえません](#atlassian-api-token-では-clone-できない)。
-    REST API は通っても `git clone` が `Authentication failed` で弾かれます。
-    必ず Bitbucket 側で発行する **Workspace Access Token** か Repository
-    Access Token を使ってください。
+- **Bitbucket の認証** — 以下の **どちらか** を用意:
+  - **(A) SSH 鍵 (推奨)** — Bitbucket に公開鍵を登録してあれば一番楽です。
+    `BB_GIT_SSH=1` を設定するとgitの clone/push は ssh で行います。
+    REST API 用には別途 token が必要 (種類は不問: Atlassian API token でも可)。
+  - **(B) Bitbucket Workspace Access Token** — `https://bitbucket.org/<workspace>/workspace/settings/access-tokens`
+    から発行。権限: **Repositories: Read** (必須) / **Account: Read** (推奨)。
+    HTTPS で clone/push するならこちらを使ってください。
+  - 注: Atlassian アカウントの API token (id.atlassian.com) は **REST API
+    専用** で、git over HTTPS では使えません ([詳細](#atlassian-api-token-では-clone-できない))。
 - **GitHub Personal Access Token (Classic 推奨)**
   - スコープ: `repo` (フル)。Org に作成する場合は `admin:org` も推奨
 
 ## 使い方
 
-```bash
-# 必須
-export BB_WORKSPACE="my-bb-team"            # Bitbucket workspace slug
-export BITBUCKET_API_TOKEN="ATATT3xFf..."   # Bitbucket / Atlassian token
-export GITHUB_TOKEN="ghp_xxxxxxxx"          # GitHub PAT
+### SSH で git 転送する場合 (推奨)
 
-# オプション (Workspace Access Token を使う場合は不要)
-# export BITBUCKET_EMAIL="alice@example.com"  # Atlassian API token を Basic 認証
-                                              # で REST API に通したいときのみ
-# export GH_ORG="my-gh-org"                   # 指定すると Org 直下に作成
-# export WORK_DIR="/var/tmp/bb2gh"            # 一時 mirror clone の置き場
-# export DRY_RUN=1                            # 実行せず計画のみ
-# export SKIP_EXISTING=1                      # 既存 GitHub repo はスキップ
+```bash
+# 0. SSH 鍵を Bitbucket に登録済みであること
+ssh -T git@bitbucket.org    # → "logged in as ..." が出れば OK
+
+# 1. 環境変数
+export BB_WORKSPACE="my-bb-team"
+export BITBUCKET_API_TOKEN="ATATT3xFf..."   # API token (REST 用なら何でも可)
+export BITBUCKET_EMAIL="alice@example.com"  # Atlassian API token を使うなら必要
+export GITHUB_TOKEN="ghp_xxxxxxxx"
+export BB_GIT_SSH=1                         # ← これで git は ssh 経由
 
 ./migrate.sh
 ```
+
+### HTTPS だけで完結させる場合
+
+```bash
+export BB_WORKSPACE="my-bb-team"
+export BITBUCKET_API_TOKEN="<Workspace Access Token>"
+export GITHUB_TOKEN="ghp_xxxxxxxx"
+
+./migrate.sh
+```
+
+### オプション
+
+```bash
+# export GH_ORG="my-gh-org"          # 指定すると Org 直下に作成
+# export WORK_DIR="/var/tmp/bb2gh"   # 一時 mirror clone の置き場
+# export DRY_RUN=1                   # 実行せず計画のみ
+# export SKIP_EXISTING=1             # 既存 GitHub repo はスキップ
+# export OVERWRITE_EXISTING=1        # 既存 GitHub repo を削除→再作成→push
+```
+
+`SKIP_EXISTING` と `OVERWRITE_EXISTING` は排他です(両方 1 にすると起動時に拒否)。
+
+### `OVERWRITE_EXISTING=1` を使う場合の注意
+
+破壊的操作なので、以下を必ず確認してください。
+
+- **GITHUB_TOKEN に `delete_repo` スコープが必要** です。
+  Classic PAT を再発行する際にチェックを入れるか、
+  Fine-grained では "Administration: Read and write" 相当を付与してください。
+- 既存リポジトリの **Issue / PR / Star / Watcher / Release / Webhook** などは
+  削除と同時に **すべて失われます**。
+- 削除されたリポジトリは GitHub の UI 経由でのみ
+  90 日以内に Restore 可能ですが、本ツールでは復元しません。
 
 スクリプトは起動時に Bitbucket の認証方式 (Bearer / Basic / x-token-auth) を
 自動判別します。`BITBUCKET_API_TOKEN` だけ渡せば最初は Bearer で叩き、

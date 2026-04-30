@@ -4,7 +4,8 @@
 #
 # Required tools : bash, curl, jq, git, git-lfs (optional)
 # Required env   : BITBUCKET_API_TOKEN, GITHUB_TOKEN, BB_WORKSPACE
-# Optional env   : BITBUCKET_EMAIL, GH_ORG, WORK_DIR, DRY_RUN, SKIP_EXISTING
+# Optional env   : BITBUCKET_EMAIL, GH_ORG, WORK_DIR, DRY_RUN, SKIP_EXISTING,
+#                  BB_GIT_SSH (=1 to use SSH for Bitbucket git transport)
 
 set -euo pipefail
 
@@ -24,6 +25,13 @@ GH_ORG="${GH_ORG:-}"                     # empty → create under your user
 WORK_DIR="${WORK_DIR:-/tmp/bb2gh}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
+OVERWRITE_EXISTING="${OVERWRITE_EXISTING:-0}"  # 1 = DELETE+recreate existing GitHub repo
+BB_GIT_SSH="${BB_GIT_SSH:-0}"            # 1 = use ssh for clone/push from Bitbucket
+
+if [ "$SKIP_EXISTING" = "1" ] && [ "$OVERWRITE_EXISTING" = "1" ]; then
+  printf '[error] SKIP_EXISTING and OVERWRITE_EXISTING are mutually exclusive\n' >&2
+  exit 2
+fi
 
 BB_API="https://api.bitbucket.org/2.0"
 GH_API="https://api.github.com"
@@ -141,11 +149,35 @@ urlenc() {
 # If both fail, the user almost certainly has an Atlassian-only API token and
 # needs a Bitbucket-side Workspace Access Token instead.
 detect_git_transport() {
-  local probe_url="$1"
-  step "verifying git transport against ${probe_url}"
+  local probe_https="$1" probe_ssh="${2:-}"
+
+  # SSH mode (BB_GIT_SSH=1): rely on the user's SSH key. Verify reachability
+  # with `git ls-remote` against the first repo's ssh URL.
+  if [ "$BB_GIT_SSH" = "1" ]; then
+    if [ -z "$probe_ssh" ] || [ "$probe_ssh" = "null" ]; then
+      err "BB_GIT_SSH=1 but no ssh clone URL was returned by Bitbucket"
+      return 1
+    fi
+    step "verifying git ssh transport against ${probe_ssh}"
+    if GIT_SSH_COMMAND="ssh -o BatchMode=yes" \
+       git ls-remote "$probe_ssh" >/dev/null 2>&1; then
+      log "git transport ok (ssh mode)"
+      BB_GIT_MODE="ssh"
+      return 0
+    fi
+    err "ssh authentication to bitbucket.org failed."
+    err "  Run this to debug:"
+    err "    ssh -T git@bitbucket.org"
+    err "  If your key isn't registered, add it at:"
+    err "    https://bitbucket.org/account/settings/ssh-keys/"
+    return 1
+  fi
+
+  # HTTPS modes.
+  step "verifying git transport against ${probe_https}"
 
   if git -c "http.https://bitbucket.org/.extraHeader=${BB_AUTH_HEADER}" \
-         ls-remote "$probe_url" >/dev/null 2>&1; then
+         ls-remote "$probe_https" >/dev/null 2>&1; then
     log "git transport ok (extraHeader mode)"
     BB_GIT_MODE="header"
     return 0
@@ -153,7 +185,7 @@ detect_git_transport() {
   warn "git extraHeader auth rejected; trying x-token-auth URL"
 
   local rest authed
-  rest="${probe_url#https://}"
+  rest="${probe_https#https://}"
   authed="https://x-token-auth:$(urlenc "$BITBUCKET_API_TOKEN")@${rest}"
   if git ls-remote "$authed" >/dev/null 2>&1; then
     log "git transport ok (x-token-auth URL mode)"
@@ -161,31 +193,45 @@ detect_git_transport() {
     return 0
   fi
 
-  err "git transport authentication failed for both supported modes."
+  err "git transport authentication failed for every HTTPS mode."
   err "  Your token authenticates against the REST API but cannot push/clone"
-  err "  via git. This is the typical behavior of an Atlassian-account API"
-  err "  token (id.atlassian.com); those work for /2.0/* but not for"
-  err "  bitbucket.org git over HTTPS."
+  err "  via git over HTTPS. This is the typical behavior of an"
+  err "  Atlassian-account API token (id.atlassian.com)."
   err ""
-  err "  Fix: create a *Bitbucket Workspace Access Token* (not an Atlassian"
-  err "  API token). In Bitbucket, open:"
-  err "    https://bitbucket.org/${BB_WORKSPACE}/workspace/settings/access-tokens"
-  err "  → Create access token → grant 'Repositories: Read' (and"
-  err "  'Account: Read' if you want /2.0/user to work). Use that token as"
-  err "  BITBUCKET_API_TOKEN, and unset BITBUCKET_EMAIL."
+  err "  Two ways to fix this:"
+  err "    A) Use SSH for git transport. Re-run with:"
+  err "         export BB_GIT_SSH=1"
+  err "       and make sure 'ssh -T git@bitbucket.org' succeeds."
+  err "    B) Create a *Bitbucket Workspace Access Token* and use it as"
+  err "       BITBUCKET_API_TOKEN (unset BITBUCKET_EMAIL):"
+  err "         https://bitbucket.org/${BB_WORKSPACE}/workspace/settings/access-tokens"
+  err "       Permissions: Repositories: Read (Account: Read recommended)."
   return 1
 }
 
 # Build a clone URL appropriate for the active git transport mode.
+# Args: <https-url> [<ssh-url>]
 bb_clone_url() {
-  local raw="$1"
-  if [ "$BB_GIT_MODE" = "url-token" ]; then
-    local rest="${raw#https://}"
-    printf 'https://x-token-auth:%s@%s' \
-      "$(urlenc "$BITBUCKET_API_TOKEN")" "$rest"
-  else
-    printf '%s' "$raw"
-  fi
+  local https_url="$1" ssh_url="${2:-}"
+  case "$BB_GIT_MODE" in
+    ssh)
+      if [ -z "$ssh_url" ] || [ "$ssh_url" = "null" ]; then
+        # Fall back: synthesize the canonical SSH form from the HTTPS URL.
+        local path="${https_url#https://bitbucket.org/}"
+        printf 'git@bitbucket.org:%s' "$path"
+      else
+        printf '%s' "$ssh_url"
+      fi
+      ;;
+    url-token)
+      local rest="${https_url#https://}"
+      printf 'https://x-token-auth:%s@%s' \
+        "$(urlenc "$BITBUCKET_API_TOKEN")" "$rest"
+      ;;
+    *)
+      printf '%s' "$https_url"
+      ;;
+  esac
 }
 
 # Extra `git -c` flags appropriate for the active git transport mode.
@@ -239,6 +285,27 @@ gh_repo_exists() {
   [ "$http" = "200" ]
 }
 
+gh_delete_repo() {
+  # DELETE /repos/{owner}/{repo}. Requires the PAT to carry the delete_repo
+  # scope (not included in plain `repo`). 204 = deleted, 404 = already gone.
+  local owner="$1" name="$2" out http
+  out="$(gh_curl DELETE "/repos/${owner}/${name}")"
+  http="${out##*$'\n'}"
+  case "$http" in
+    204|404) return 0 ;;
+    403)
+      err "GitHub delete-repo ${owner}/${name} forbidden (HTTP 403)."
+      err "  The PAT in GITHUB_TOKEN is missing the 'delete_repo' scope."
+      err "  Add it at https://github.com/settings/tokens and rerun."
+      return 1
+      ;;
+    *)
+      err "GitHub delete-repo ${owner}/${name} failed (HTTP $http): ${out%$'\n'*}"
+      return 1
+      ;;
+  esac
+}
+
 gh_create_repo() {
   local name="$1" desc="$2" private="$3" path body out http
   if [ -n "$GH_ORG" ]; then
@@ -270,6 +337,8 @@ list_bb_repos() {
       .values[]
       | ( [ .links.clone[]? | select(.name == "https") | .href ] | .[0] // "" )
         as $href
+      | ( [ .links.clone[]? | select(.name == "ssh")   | .href ] | .[0] // "" )
+        as $sshref
       | select($href != "")
       | {
           slug,
@@ -277,7 +346,8 @@ list_bb_repos() {
           description: (.description // ""),
           is_private: (.is_private // true),
           # strip embedded "user@" if Bitbucket included one
-          https: ($href | sub("^https://[^@]+@"; "https://"))
+          https: ($href | sub("^https://[^@]+@"; "https://")),
+          ssh:   $sshref
         }
     '
     url="$(printf '%s' "$page" | jq -r '.next // empty')"
@@ -288,17 +358,25 @@ list_bb_repos() {
 # Per-repo migration
 # -----------------------------------------------------------------------------
 migrate_one() {
-  local slug="$1" name="$2" desc="$3" private="$4" bb_https="$5" gh_owner="$6"
+  local slug="$1" name="$2" desc="$3" private="$4"
+  local bb_https="$5" bb_ssh="$6" gh_owner="$7"
   local privacy_label
   [ "$private" = "true" ] && privacy_label="private" || privacy_label="public"
   log "==> ${slug}  [${privacy_label}]"
 
-  # 1. Ensure GitHub side exists
+  # 1. Ensure GitHub side exists in the desired clean state.
   if gh_repo_exists "$gh_owner" "$slug"; then
     log "    github repo ${gh_owner}/${slug} already exists"
     if [ "$SKIP_EXISTING" = "1" ]; then
       log "    SKIP_EXISTING=1; leaving destination untouched"
       return 0
+    fi
+    if [ "$OVERWRITE_EXISTING" = "1" ]; then
+      step "    OVERWRITE_EXISTING=1: deleting and recreating ${gh_owner}/${slug}"
+      if [ "$DRY_RUN" != "1" ]; then
+        gh_delete_repo "$gh_owner" "$slug" || return 1
+        gh_create_repo "$slug" "$desc" "$private" || return 1
+      fi
     fi
   else
     step "    creating github repo ${gh_owner}/${slug} (${privacy_label})"
@@ -311,7 +389,7 @@ migrate_one() {
   local gh_authed local_dir bb_url
   gh_authed="https://x-access-token:$(urlenc "$GITHUB_TOKEN")@github.com/${gh_owner}/${slug}.git"
   local_dir="${WORK_DIR}/${slug}.git"
-  bb_url="$(bb_clone_url "$bb_https")"
+  bb_url="$(bb_clone_url "$bb_https" "$bb_ssh")"
 
   # Read bb_git_cfg into an array (may be empty).
   local -a bb_cfg=()
@@ -373,10 +451,11 @@ main() {
   # Probe git transport with the first repo's clone URL before kicking off
   # the (potentially long) migration loop. This converts a token type
   # mismatch from "all 25 fail with the same message" into one clear error.
-  local probe_url
-  probe_url="$(printf '%s' "$repos_jsonl" | head -1 | jq -r .https)"
+  local probe_https probe_ssh
+  probe_https="$(printf '%s' "$repos_jsonl" | head -1 | jq -r .https)"
+  probe_ssh="$(printf '%s' "$repos_jsonl" | head -1 | jq -r '.ssh // empty')"
   if [ "$DRY_RUN" != "1" ]; then
-    detect_git_transport "$probe_url" || exit 1
+    detect_git_transport "$probe_https" "$probe_ssh" || exit 1
   fi
 
   local gh_owner
@@ -387,17 +466,19 @@ main() {
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     idx=$((idx + 1))
-    local slug name desc is_private https
+    local slug name desc is_private https ssh
     slug="$(printf '%s' "$line"        | jq -r .slug)"
     name="$(printf '%s' "$line"        | jq -r .name)"
     desc="$(printf '%s' "$line"        | jq -r .description)"
     is_private="$(printf '%s' "$line"  | jq -r .is_private)"
     https="$(printf '%s' "$line"       | jq -r .https)"
+    ssh="$(printf '%s' "$line"         | jq -r '.ssh // empty')"
     if [ -z "$slug" ] || [ -z "$https" ] || [ "$https" = "null" ]; then
       warn "  skipping malformed entry: $line"
       continue
     fi
-    if migrate_one "$slug" "$name" "$desc" "$is_private" "$https" "$gh_owner"; then
+    if migrate_one "$slug" "$name" "$desc" "$is_private" \
+                   "$https" "$ssh" "$gh_owner"; then
       ok=$((ok + 1))
       log "    done: ${slug}  (${idx}/${total})"
     else
