@@ -22,11 +22,15 @@ Bitbucket Cloud のワークスペースに含まれる全リポジトリを Git
 - Python 3.10 以上 (標準ライブラリのみ)
 - `git` 本体 (1.8 以降)
 - `git-lfs` (LFS リポジトリを扱う場合)
-- 環境変数:
-  - `BITBUCKET_USERNAME` — Bitbucket のユーザ名
-  - `BITBUCKET_APP_PASSWORD` — App Password (`Repositories: Read` 必須)
+- 環境変数 (推奨: Atlassian API token):
+  - `BITBUCKET_EMAIL` — Atlassian アカウントのメールアドレス
+  - `BITBUCKET_API_TOKEN` — Bitbucket スコープ付き API token
+    (`read:account`, `read:repository:bitbucket` が必須)
   - `GITHUB_TOKEN` — GitHub Personal Access Token
     (`repo` スコープ。Org に作成する場合はさらに `admin:org` も推奨)
+- 旧式の App Password を使う場合は代わりに
+  `BITBUCKET_USERNAME` / `BITBUCKET_APP_PASSWORD` を設定してください
+  (Atlassian は App Password を段階廃止中)。
 
 ## インストール
 
@@ -45,8 +49,8 @@ python -m b2g --help
 ユーザーアカウント直下に作成する例:
 
 ```
-export BITBUCKET_USERNAME=alice
-export BITBUCKET_APP_PASSWORD=xxxxxxxxxxxx
+export BITBUCKET_EMAIL=alice@example.com
+export BITBUCKET_API_TOKEN=ATATT3xFfGF0...
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
 
 python -m b2g \

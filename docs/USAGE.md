@@ -77,14 +77,29 @@ LFS は容量を消費しがちなので余裕を持って割り当ててくだ�
 
 ## 認証情報の取得
 
-### Bitbucket App Password
+### Bitbucket — Atlassian API token (推奨)
 
-1. Bitbucket にログインし、右上アバター → **Personal settings**
-2. 左メニュー **App passwords** → **Create app password**
-3. 名前: `b2g-migration` など
-4. 権限: **Repositories: Read** (必須) ・ **Account: Read** (推奨)
-5. 表示されたパスワードを **その場で控える**
-   (再表示できません)
+Atlassian は Bitbucket Cloud の **App Password を段階廃止** しています。
+新規作成できないアカウントでは **API token** を使います。
+
+1. <https://id.atlassian.com/manage-profile/security/api-tokens> へアクセス
+2. **Create API token with scopes** をクリック
+   (古い "Create API token" は Confluence/Jira 用で Bitbucket には使えません)
+3. App として **Bitbucket** を選択
+4. スコープに最低限以下を含める:
+   - `read:account` — `/2.0/user`, `/2.0/workspaces` 用
+   - `read:repository:bitbucket` — リポジトリ列挙 / clone 用
+5. 生成されたトークンを **その場で控える** (再表示不可)
+6. **認証時のユーザー名は Atlassian アカウントのメールアドレス**
+   (Bitbucket username ではない点に注意)
+
+### Bitbucket — App Password (旧方式・新規作成不可なら飛ばす)
+
+すでに有効な App Password がある場合のみ使えます。
+
+1. Bitbucket → 右上アバター → **Personal settings**
+2. **App passwords** → **Create app password**
+3. 権限: **Repositories: Read** (必須) ・ **Account: Read** (推奨)
 
 ### GitHub Personal Access Token (PAT)
 
@@ -100,11 +115,24 @@ Classic PAT を推奨します。
 
 ### 環境変数として設定
 
+API token を使う場合 (推奨):
+
+```bash
+export BITBUCKET_EMAIL="alice@example.com"     # Atlassian アカウントのメール
+export BITBUCKET_API_TOKEN="ATATT3xFfGF0..."   # 上で発行した API token
+export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+App Password を使う場合 (旧):
+
 ```bash
 export BITBUCKET_USERNAME="alice"
 export BITBUCKET_APP_PASSWORD="xxxxxxxxxxxxxxxxxxxx"
 export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
+
+両方が設定されている場合は **API token 系 (`BITBUCKET_EMAIL` /
+`BITBUCKET_API_TOKEN`) が優先** されます。
 
 `direnv` などを使い、シェル履歴に直書きしないことを強く推奨します。
 
@@ -173,8 +201,8 @@ python -m b2g [-h] -w WORKSPACE
 ### ① 個人アカウントへ全リポジトリをコピー
 
 ```bash
-export BITBUCKET_USERNAME=alice
-export BITBUCKET_APP_PASSWORD=xxxxxxxxxxxx
+export BITBUCKET_EMAIL=alice@example.com
+export BITBUCKET_API_TOKEN=ATATT3xFfGF0...
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
 
 python -m b2g --workspace my-bb-team
@@ -297,29 +325,38 @@ python -m b2g --workspace my-bb-team
 
 ### `Bitbucket API error 401`
 
-- App Password の権限不足 (Repositories: Read 必須)
-- ユーザー名がメールアドレスになっている (App Password はユーザー名で認証)
-- **Atlassian は Bitbucket Cloud の App Password を段階的廃止しています。**
-  既存のものが失効している / 新規作成できない場合は **Atlassian API token**
-  に切り替え、`BITBUCKET_USERNAME` には Atlassian アカウントのメールを設定
-  してください (Basic 認証は `<email>:<api-token>` になります)。
+- **API token のスコープ不足** — `read:account` と
+  `read:repository:bitbucket` が必須です。古いスコープ無し API token は
+  Bitbucket では使えません
+- **ユーザー名側の指定ミス** — API token は **メールアドレス** で認証
+  (`BITBUCKET_EMAIL`)。逆に App Password は **ユーザー名** で認証
+  (`BITBUCKET_USERNAME`)。混ぜると 401 になります
+- App Password を使っているなら、Atlassian の段階廃止により失効している可能性あり
+  → API token への切替が必要
 
 切り分けに便利な curl:
 
 ```bash
+# 環境変数の準備 (API token の場合)
+USER_PART="$BITBUCKET_EMAIL"
+SECRET="$BITBUCKET_API_TOKEN"
+# (App Password の場合は次のように)
+# USER_PART="$BITBUCKET_USERNAME"
+# SECRET="$BITBUCKET_APP_PASSWORD"
+
 # (a) 認証情報そのものの検証
 curl -s -o /dev/null -w "/user => %{http_code}\n" \
-  -u "$BITBUCKET_USERNAME:$BITBUCKET_APP_PASSWORD" \
+  -u "$USER_PART:$SECRET" \
   https://api.bitbucket.org/2.0/user
 
 # (b) 自分がアクセスできるワークスペース一覧
-curl -s -u "$BITBUCKET_USERNAME:$BITBUCKET_APP_PASSWORD" \
+curl -s -u "$USER_PART:$SECRET" \
   https://api.bitbucket.org/2.0/workspaces \
   | python -m json.tool | grep '"slug"'
 ```
 
 (a) が 200 なら認証 OK。(b) で出てきた `slug` を `--workspace` に渡してください。
-`b2g` 側でも v0.1.1 以降は同等のプリフライト確認を行い、ワークスペース 401 時には
+`b2g` 側でも同等のプリフライト確認を行い、ワークスペース 401 時には
 利用可能なスラッグ候補を表示します。
 
 ### `GitHub repo creation failed: HTTP 422 ... name already exists`

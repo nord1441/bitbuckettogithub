@@ -22,7 +22,7 @@ def migrate_one(cfg: Config, owner: str, repo: bitbucket.BBRepo) -> None:
         return
 
     src_url = git.authed_url(
-        repo.https_clone_url, cfg.bitbucket_user, cfg.bitbucket_app_password
+        repo.https_clone_url, cfg.bitbucket_user, cfg.bitbucket_secret
     )
     local_path = os.path.join(cfg.work_dir, f"{repo.slug}.git")
     dst_url = github.clone_url(owner, target_name)

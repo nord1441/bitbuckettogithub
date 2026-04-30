@@ -110,14 +110,15 @@ def _check_credentials(headers: dict[str, str]) -> dict | None:
         raise SystemExit(
             "Bitbucket authentication failed (HTTP "
             f"{code} on /2.0/user).\n"
-            "  Check that BITBUCKET_USERNAME is your Bitbucket *username*\n"
-            "  (not email), and that the App Password has scopes:\n"
-            "    - Account: Read\n"
-            "    - Repositories: Read\n"
-            "  Note: Atlassian is phasing out Bitbucket App Passwords. If\n"
-            "  yours has been revoked or you cannot create one, switch to an\n"
-            "  Atlassian API token and set BITBUCKET_USERNAME to your\n"
-            "  account email.\n"
+            "  Recommended setup (API token, current Atlassian standard):\n"
+            "    BITBUCKET_EMAIL     = your Atlassian account email\n"
+            "    BITBUCKET_API_TOKEN = token from https://id.atlassian.com/manage-profile/security/api-tokens\n"
+            "  The token must include the Bitbucket scopes:\n"
+            "    read:account, read:repository:bitbucket\n"
+            "  Legacy setup (App Password, being phased out):\n"
+            "    BITBUCKET_USERNAME      = your Bitbucket username (NOT email)\n"
+            "    BITBUCKET_APP_PASSWORD  = app password with\n"
+            "      'Account: Read' and 'Repositories: Read' scopes\n"
             f"  Response body: {raw[:400] or '(empty)'}"
         )
     _raise_api_error(code, f"{API_BASE}/user", raw)
@@ -137,7 +138,7 @@ def list_repositories(cfg: Config) -> list[BBRepo]:
     headers = {
         "Accept": "application/json",
         "Authorization": _basic_auth_header(
-            cfg.bitbucket_user, cfg.bitbucket_app_password
+            cfg.bitbucket_user, cfg.bitbucket_secret
         ),
         "User-Agent": "b2g-py/0.1",
     }
