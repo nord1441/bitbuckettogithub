@@ -333,21 +333,24 @@ list_bb_repos() {
   local page
   while [ -n "$url" ] && [ "$url" != "null" ]; do
     page="$(bb_curl "$url")" || die "failed to list Bitbucket repos"
+    # We synthesize clone URLs from `.full_name` (which is the canonical
+    # `<workspace_slug>/<repo_slug>`, always lowercase), instead of trusting
+    # `links.clone[].href`. Some older Bitbucket repos return mixed-case URLs
+    # via that link list, which then fail to clone.
     printf '%s' "$page" | jq -c '
       .values[]
-      | ( [ .links.clone[]? | select(.name == "https") | .href ] | .[0] // "" )
-        as $href
-      | ( [ .links.clone[]? | select(.name == "ssh")   | .href ] | .[0] // "" )
-        as $sshref
-      | select($href != "")
+      | ( .full_name
+          // ((.workspace.slug // "") + "/" + (.slug // ""))
+        ) as $fn
+      | select($fn != "/" and $fn != "")
       | {
           slug,
           name: (.name // .slug),
           description: (.description // ""),
           is_private: (.is_private // true),
-          # strip embedded "user@" if Bitbucket included one
-          https: ($href | sub("^https://[^@]+@"; "https://")),
-          ssh:   $sshref
+          full_name: $fn,
+          https: ("https://bitbucket.org/" + $fn + ".git"),
+          ssh:   ("git@bitbucket.org:"   + $fn + ".git")
         }
     '
     url="$(printf '%s' "$page" | jq -r '.next // empty')"
@@ -405,9 +408,9 @@ migrate_one() {
 
   # 3. mirror clone (bare) — idempotent: nuke any leftover.
   rm -rf -- "$local_dir"
-  step "    clone --mirror ${bb_https}"
+  step "    clone --mirror ${bb_url}"
   git "${bb_cfg[@]}" clone --mirror "$bb_url" "$local_dir" \
-    || { err "    clone failed for ${slug}"; return 1; }
+    || { err "    clone failed for ${slug} (url=${bb_url})"; return 1; }
 
   # 4. LFS fetch (no-op when not used; warn-only if git-lfs missing)
   if command -v git-lfs >/dev/null 2>&1; then
